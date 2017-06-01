@@ -2,6 +2,7 @@
 import dill as pickle
 import json as json
 import os
+import hashlib
 
 
 class Waterfall(object):
@@ -67,11 +68,26 @@ class Waterfall(object):
     def __init__(self, **config):
         self._config = config
         self._pipes = []
+        self._values = {}
 
     def pipe(self, func, *args, **kwargs):
+        retrieve = kwargs.get('retrieve')
+
+        if retrieve is None:
+            retrieve = []
+
+        if isinstance(retrieve, (str, unicode)):
+            retrieve = [retrieve]
+
         self._pipes.append({
             'type': 'func',
+            'retrieve': retrieve,
             'contents': [self.dump(func), args, kwargs]})
+
+        return self
+
+    def save(self, varname):
+        self._pipes.append({'type': 'save', 'contents': varname})
 
         return self
 
@@ -90,8 +106,11 @@ class Waterfall(object):
 
     def _run_func_segment(self, spec, remaining_pipes, prev=None):
 
-        func = self.load(spec[0])
-        args, kwargs = spec[1:]
+        func = self.load(spec['contents'][0])
+        args, kwargs = spec['contents'][1:]
+
+        if 'retrieve' in spec:
+            kwargs.update({k: self._values[k] for k in spec['retrieve']})
 
         if prev is not None:
             args = tuple([prev] + list(args))
@@ -102,8 +121,12 @@ class Waterfall(object):
 
     def _run_nest_segment(self, spec, remaining_pipes, prev=None):
 
-        for r in spec.run(init=prev):
+        for r in spec['contents'].run(init=prev):
             yield r
+
+    def _save_segment(self, spec, remaining_pipes, prev=None):
+        self._values[spec['contents']] = prev
+        return self._handle_segment(remaining_pipes, prev)
 
     def _handle_segment(self, pipes, prev=None):
         if len(pipes) > 0:
@@ -120,7 +143,10 @@ class Waterfall(object):
             elif spec['type'] == 'nest':
                 handler = self._run_nest_segment
 
-            for r in handler(spec['contents'], rest, prev):
+            elif spec['type'] == 'save':
+                handler = self._save_segment
+
+            for r in handler(spec, rest, prev):
                 yield r
 
         else:
@@ -170,12 +196,22 @@ class LocalFall(PickleFall):
         return w
 
     def dump(self, val):
-        with open(
-                os.path.join(self._config['pickledir'], val.__name__),
-                'wb+') as f:
 
-            pickle.dump(val, f)
-            return val.__name__
+        pickled = pickle.dumps(val)
+        digest = hashlib.sha256(pickled).hexdigest()
+
+        try:
+            basename = val.__name__ + '_' + digest
+            fname = os.path.join(self._config['pickledir'], basename)
+            with open(fname, 'wb+') as f:
+                f.write(pickled)
+                return fname
+        except IOError:
+            basename = digest
+            fname = os.path.join(self._config['pickledir'], basename)
+            with open(fname, 'wb+') as f:
+                f.write(pickled)
+                return fname
 
     def load(self, val):
         with open(os.path.join(self._config['pickledir'], val), 'rb') as f:
